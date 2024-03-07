@@ -37,6 +37,10 @@
 #define CEILING_LOCKING 2
 #define MRSP_LOCKING 3
 
+#define HIGH_PRIORITY 1
+#define MED_PRIORITY 2
+#define LOW_PRIORITY 3
+
 #define UINT32_MAX 4294967295
 
 
@@ -83,7 +87,8 @@ typedef Task {
     byte pmlid; // Promela process id
     mtype state ; // {Ready,SemaWait,TimeWait,OtherWait}
     bool preemptable;
-    byte prio; // lower number is higher priority
+    byte prio; // task's initial base priority - lower number is higher priority 
+    int effectivePriority; // task's current active priority
     int ticks; // clock ticks to keep track of timeout
     bool tout; // true if woken by a timeout
 };
@@ -97,10 +102,11 @@ typedef Semaphore_model {
     int LockingProtocol; //None/Inherit/Ceiling/MRsP
     bool isGlobal; // true for global, false for local
     bool isInitialised; // indicated whenever this semaphore was created
-    int taskPriority; // relevant for binary sem, 0 otherwise
+    int taskPriority; // relevant for binary sem, 0 otherwise - tracks the current elevated priority of the semaphore's task holder
     bool isFlushed; //if true all tasks waiting must be flushed.
     int waiters[TASK_MAX]; // waiters on the semaphore indicated by position in queue ( 1 is next in queue)
     int ownerPid; // set to pid of the task that obtained the binary semaphore
+    int priorityCeiling; // stores the priority ceiling of the binary semaphore
     //bool isFIFO; // true for tasks wait by FIFO (default)
     //bool isPriority // true for tasks wait by priority
     //bool isBinary; // true if binary semaphore
@@ -250,10 +256,12 @@ inline sema_create(name,count, maxcount, scope,rtems_priority,sem_type,locking,t
                     ::  sem_type == BINARY_S ->
 
                         model_semaphores[id].maxCount = 1;
+                        model_semaphores[id].LockingProtocol = locking;
                         model_semaphores[id].s_name = name;
                         model_semaphores[id].semType = sem_type;
                         model_semaphores[id].isGlobal = scope; //if local can only be used by node that created it
                         model_semaphores[id].Priority = rtems_priority;
+                        model_semaphores[id].priorityCeiling = HIGH_PRIORITY;
                         model_semaphores[id].isInitialised = true;
                         model_semaphores[id].taskPriority = task_priority;
                         rc = RC_OK;
@@ -366,6 +374,62 @@ inline WaitForSemaphore(tid,sem_id, optionset, interval, rc){
 
 
 /*
+* Helper functions for priority queueing
+*/
+
+inline priority_enqueue(sem_id, task_id, Priority) {
+    atomic {
+        if
+        :: model_semaphores[sem_id].waiters[0] == 0 ->
+            // The queue is empty
+            model_semaphores[sem_id].waiters[0] = 1; // Set the size of the queue to 1
+            model_semaphores[sem_id].waiters[1] = task_id; // Insert the task at the front of the queue
+        :: model_semaphores[sem_id].waiters[0] < TASK_MAX - 1 ->
+            int i = model_semaphores[sem_id].waiters[0] + 1; // Get the size of the queue and move to the next position
+            do
+            :: i > 1 && tasks[model_semaphores[sem_id].waiters[i - 1]].prio > Priority -> // > or <
+                printf("@@@ %d LOG true! %d < %d\n",_pid, tasks[model_semaphores[sem_id].waiters[i - 1]].prio, Priority);
+                // Shift elements to make room for the new task in the sorted order
+                model_semaphores[sem_id].waiters[i] = model_semaphores[sem_id].waiters[i - 1];
+                i--;
+            :: else -> break;
+            od;
+            // Insert the task at the correct position in the sorted queue
+            model_semaphores[sem_id].waiters[i] = task_id;
+            model_semaphores[sem_id].waiters[0]++; // Increment the size of the queue
+        :: else ->
+            // The queue is full
+            skip;
+        fi
+    }
+}
+
+
+inline priority_dequeue(sem_id, task_id) {
+    atomic {
+        if
+        :: model_semaphores[sem_id].waiters[0] > 0 ->
+            // The queue is not empty
+            task_id = model_semaphores[sem_id].waiters[1]; // Get the task at the front of the queue
+            // Shift elements to fill the gap left by dequeuing the task
+            int i = 1;
+            do
+            :: i < model_semaphores[sem_id].waiters[0] ->
+                model_semaphores[sem_id].waiters[i] = model_semaphores[sem_id].waiters[i + 1];
+                i++;
+            :: else -> break;
+            od
+            model_semaphores[sem_id].waiters[0]--; // Decrement the size of the queue
+        :: else ->
+            // The queue is empty
+            task_id = 0;
+        fi
+    }
+}
+
+
+
+/*
  * sema_obtain(self,sem_id, optionset, timeout, rc)
  *
  * Simulates a call to rtems_semaphore_obtain
@@ -440,11 +504,22 @@ inline sema_obtain(self, sem_id, optionset, interval,rc) {
                     model_semaphores[sem_id].ownerPid = _pid; // Set the current pid as owner
                     rc = RC_OK;
                     printf("@@@ %d LOG Binary Semaphore %d obtained\n", _pid, sem_id);
-                :: else ->
+
+                :: else -> // Binary semaphore is not available
                     if
-                    :: model_semaphores[sem_id].Count == 0 && optionset == RTEMS_NO_WAIT ->
+                    :: optionset == RTEMS_NO_WAIT ->
                         rc = RC_Unsatisfied; // The semaphore could not be immediately obtained  
                         printf("@@@ %d LOG Semaphore %d could not be immediately obtained\n", _pid, sem_id);
+
+                    :: else -> // RTEMS_WAIT
+                    :: model_semaphores[sem_id].Priority == PRIORITY &&
+                       model_semaphores[sem_id].LockingProtocol == CEILING_LOCKING ->
+
+                        if
+                        :: tasks[self].prio < model_semaphores[sem_id].priorityCeiling ->
+                            tasks[self].effectivePriority = model_semaphores[sem_id].priorityCeiling;
+                            priority_enqueue(sem_id, self, tasks[self].effectivePriority);                        
+                        fi
                     fi
                 fi
             fi
@@ -480,27 +555,50 @@ inline sema_release(self,sem_id,rc) {
             model_semaphores[sem_id].Count++;
 
             int tid = 1;
-            do 
-            ::  tid < TASK_MAX ->
-                if 
-                ::  model_semaphores[sem_id].waiters[tid] == 1 -> 
-                    model_semaphores[sem_id].waiters[tid] = 0;
-                    tasks[tid].state = Ready;
-                    int updatetid=1;
-                    do
-                    ::  updatetid < TASK_MAX ->
-                        if 
-                        ::  model_semaphores[sem_id].waiters[updatetid]!=0 -> model_semaphores[sem_id].waiters[updatetid]--
-                        ::  else -> skip;
-                        fi 
-                        updatetid++;
-                    ::  else -> break;
-                    od
-                ::  else -> skip;
+
+            if
+            :: model_semaphores[sem_id].LockingProtocol == NO_LOCKING ||
+               model_semaphores[sem_id].Priority == FIFO ->
+
+                do 
+                ::  tid < TASK_MAX ->
+                    if 
+                    ::  model_semaphores[sem_id].waiters[tid] == 1 -> 
+                        model_semaphores[sem_id].waiters[tid] = 0;
+                        tasks[tid].state = Ready;
+                        int updatetid=1;
+                        do
+                        ::  updatetid < TASK_MAX ->
+                            if 
+                            ::  model_semaphores[sem_id].waiters[updatetid]!=0 -> model_semaphores[sem_id].waiters[updatetid]--
+                            ::  else -> skip;
+                            fi 
+                            updatetid++;
+                        ::  else -> break;
+                        od
+                    ::  else -> skip;
+                    fi
+                    tid++;
+                ::  else-> break;
+                od
+
+            :: model_semaphores[sem_id].LockingProtocol == CEILING_LOCKING &&
+               model_semaphores[sem_id].Priority == PRIORITY ->
+
+                // Dequeue the highest-priority waiting task
+                int highestPriorityTask = 0;
+                priority_dequeue(sem_id, highestPriorityTask);
+
+                if
+                :: highestPriorityTask != 0 ->
+                    // Elevate priority of waiting task
+                    tasks[highestPriorityTask].effectivePriority = model_semaphores[sem_id].priorityCeiling;
+                    //tasks[highestPriorityTask].state = Ready;
+
+                    // Reset the effective Priority of the releasing task
+                    tasks[self].effectivePriority = tasks[self].prio;
                 fi
-                tid++;
-            ::  else-> break;
-            od
+            fi
 
             printf("@@@ %d LOG Semaphore %d released\n", _pid, sem_id)
             rc = RC_OK;
@@ -597,6 +695,54 @@ inline sema_flush(self, sem_id, rc) {
 
 
 
+inline sema_set_priority(sem_id, scheduler_id, new_priority, old_priority, rc) {
+    atomic {
+        if
+        :: sem_id == 0 ->
+            rc = RC_InvId;
+        :: else ->
+            if
+            :: scheduler_id != SCHED_A && scheduler_id != SCHED_B ->
+                rc = RC_InvId;
+            :: else ->
+                // Initialize old_priority
+                old_priority = 0;
+                // Find scheduler index
+                int scheduler_index = 0;
+                if
+                :: scheduler_id == SCHED_A ->
+                    scheduler_index = 1;
+                :: scheduler_id == SCHED_B ->
+                    scheduler_index = 2;
+                fi
+                // Save old priority
+                if
+                :: model_semaphores[sem_id].Priority == PRIORITY &&
+                   model_semaphores[sem_id].LockingProtocol == CEILING_LOCKING ->
+                    old_priority = model_semaphores[sem_id].taskPriority[scheduler_index];
+                :: else ->
+                    rc = RC_NotDefined;
+                fi
+                // Set new priority
+                if
+                :: new_priority == RTEMS_CURRENT_PRIORITY ->
+                    // Return current priority without changing it
+                    rc = RC_OK;
+                :: model_semaphores[sem_id].Priority == PRIORITY &&
+                   model_semaphores[sem_id].LockingProtocol == CEILING_LOCKING ->
+                    model_semaphores[sem_id].taskPriority[scheduler_index] = new_priority;
+                    rc = RC_OK;
+                :: else ->
+                    rc = RC_InvalidPriority;
+                fi
+            fi
+        fi
+    }
+}
+
+
+
+
 /*
  * Scenario Generation
  */
@@ -677,7 +823,7 @@ int task2Sema;
 int task3Sema;
 
 
-mtype = {onesema, twosemas, dfferent_sema_counts, one_binary_sema};
+mtype = {onesema, twosemas, dfferent_sema_counts, one_binary_sema, test_priority_ceiling};
 mtype scenario;
 
 inline chooseScenario() {
@@ -734,10 +880,11 @@ inline chooseScenario() {
     task3Core = THIS_CORE;
 
     if
-    ::  scenario = onesema;
-    ::  scenario = twosemas;
-    ::  scenario = dfferent_sema_counts;
-    ::  scenario = one_binary_sema;
+    // ::  scenario = onesema;
+    // ::  scenario = twosemas;
+    // ::  scenario = dfferent_sema_counts;
+    // ::  scenario = one_binary_sema;
+    ::  scenario = test_priority_ceiling;
     fi
     atomic{printf("@@@ %d LOG scenario ",_pid); printm(scenario); nl()}
     
@@ -901,6 +1048,27 @@ inline chooseScenario() {
         // fi
 
 
+    ::  scenario == test_priority_ceiling ->
+        task_in[TASK1_ID].semType = BINARY_S;
+        task_in[TASK1_ID].Wait = true;
+        task_in[TASK1_ID].isPriority = PRIORITY;
+        task_in[TASK1_ID].LockingProtocol = CEILING_LOCKING;
+
+        task_in[TASK1_ID].taskPrio = HIGH_PRIORITY;
+        task_in[TASK2_ID].taskPrio = LOW_PRIORITY;
+        task_in[TASK3_ID].taskPrio = MED_PRIORITY;
+
+        task_in[TASK1_ID].doAcquire = true;
+        task_in[TASK1_ID].doRelease = true;        
+        
+        task_in[TASK2_ID].doAcquire = true;
+        task_in[TASK2_ID].doRelease = true;
+
+        task_in[TASK3_ID].doAcquire = true;
+        task_in[TASK3_ID].doRelease = true;
+
+        printf("@@@ %d LOG sub-senario created, testing priority ceiling protocol \n", _pid);
+
     fi
 
 
@@ -913,7 +1081,7 @@ proctype Runner (byte nid, taskid; TaskInputs opts) {
     tasks[taskid].nodeid = nid;
     tasks[taskid].pmlid = _pid;
     tasks[taskid].prio = opts.taskPrio;
-    
+    tasks[taskid].effectivePriority = opts.taskPrio;
    
 
     printf("@@@ %d TASK Runner\n",_pid);
@@ -1132,6 +1300,7 @@ proctype Worker0 (byte nid, taskid; TaskInputs opts) {
     tasks[taskid].nodeid = nid;
     tasks[taskid].pmlid = _pid;
     tasks[taskid].prio = opts.taskPrio;
+    tasks[taskid].effectivePriority = opts.taskPrio;
     
     printf("@@@ %d TASK Worker0\n",_pid);
     if 
@@ -1337,6 +1506,7 @@ proctype Worker1 (byte nid, taskid; TaskInputs opts) {
     tasks[taskid].nodeid = nid;
     tasks[taskid].pmlid = _pid;
     tasks[taskid].prio = opts.taskPrio;
+    tasks[taskid].effectivePriority = opts.taskPrio;
     
 
 
